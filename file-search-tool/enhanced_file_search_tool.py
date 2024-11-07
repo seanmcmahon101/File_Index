@@ -8,19 +8,46 @@ import time
 import subprocess
 import sys
 
-# Function to initialize the database
+# Function to initialize the database and handle migrations
 def initialize_db(conn):
   c = conn.cursor()
-  c.execute('''
-      CREATE TABLE IF NOT EXISTS files (
-          filename TEXT,
-          filepath TEXT,
-          modified_time REAL
-      )
-  ''')
-  c.execute('CREATE INDEX IF NOT EXISTS idx_filename ON files(filename)')
-  c.execute('CREATE INDEX IF NOT EXISTS idx_filepath ON files(filepath)')
-  conn.commit()
+  # Check if the 'files' table exists
+  c.execute("""
+      SELECT name FROM sqlite_master 
+      WHERE type='table' AND name='files';
+  """)
+  table_exists = c.fetchone()
+
+  if not table_exists:
+      # Create the table with the required columns
+      c.execute('''
+          CREATE TABLE files (
+              filename TEXT,
+              filepath TEXT,
+              modified_time REAL
+          )
+      ''')
+      # Create indexes
+      c.execute('CREATE INDEX IF NOT EXISTS idx_filename ON files(filename)')
+      c.execute('CREATE INDEX IF NOT EXISTS idx_filepath ON files(filepath)')
+      conn.commit()
+  else:
+      # Check if 'modified_time' column exists
+      c.execute("PRAGMA table_info(files);")
+      columns = [info[1] for info in c.fetchall()]
+      if 'modified_time' not in columns:
+          # Add 'modified_time' column
+          c.execute("ALTER TABLE files ADD COLUMN modified_time REAL;")
+          conn.commit()
+
+      # Ensure indexes exist
+      c.execute("PRAGMA index_list('files');")
+      indexes = [row[1] for row in c.fetchall()]
+      if 'idx_filename' not in indexes:
+          c.execute('CREATE INDEX idx_filename ON files(filename)')
+      if 'idx_filepath' not in indexes:
+          c.execute('CREATE INDEX idx_filepath ON files(filepath)')
+      conn.commit()
 
 # Function to index files on the C: drive
 def index_files(update_callback=None, complete_callback=None):
@@ -34,9 +61,14 @@ def index_files(update_callback=None, complete_callback=None):
   file_count = 0
   start_time = time.time()
 
-  # Fetch existing file paths and their modified times
-  c.execute('SELECT filepath, modified_time FROM files')
-  existing_files = {row[0]: row[1] for row in c.fetchall()}
+  try:
+      # Fetch existing file paths and their modified times
+      c.execute('SELECT filepath, modified_time FROM files')
+      existing_files = {row[0]: row[1] for row in c.fetchall()}
+  except sqlite3.Error as e:
+      messagebox.showerror("Database Error", f"Error fetching existing files: {e}")
+      conn.close()
+      return
 
   # Set to keep track of current files
   current_files = set()
@@ -67,25 +99,40 @@ def index_files(update_callback=None, complete_callback=None):
                   c.execute('INSERT INTO files (filename, filepath, modified_time) VALUES (?, ?, ?)',
                             (name.lower(), filepath, modified_time))
                   file_count += 1
-          except Exception as e:
+          except Exception:
               # Handle any exceptions (e.g., permission errors)
               continue
 
       # Commit periodically to reduce memory usage
       if file_count >= 1000:
-          conn.commit()
-          file_count = 0
+          try:
+              conn.commit()
+              file_count = 0
+          except sqlite3.Error as e:
+              messagebox.showerror("Database Error", f"Error committing to database: {e}")
+              conn.close()
+              return
 
   # Remove deleted files from the database
-  c.execute('SELECT filepath FROM files')
-  all_indexed_files = set(row[0] for row in c.fetchall())
-  deleted_files = all_indexed_files - current_files
+  try:
+      c.execute('SELECT filepath FROM files')
+      all_indexed_files = set(row[0] for row in c.fetchall())
+      deleted_files = all_indexed_files - current_files
 
-  if deleted_files:
-      c.executemany('DELETE FROM files WHERE filepath = ?', [(fp,) for fp in deleted_files])
-      file_count += len(deleted_files)
+      if deleted_files:
+          c.executemany('DELETE FROM files WHERE filepath = ?', [(fp,) for fp in deleted_files])
+          file_count += len(deleted_files)
+  except sqlite3.Error as e:
+      messagebox.showerror("Database Error", f"Error removing deleted files: {e}")
+      conn.close()
+      return
 
-  conn.commit()
+  # Final commit
+  try:
+      conn.commit()
+  except sqlite3.Error as e:
+      messagebox.showerror("Database Error", f"Error during final commit: {e}")
+
   conn.close()
   end_time = time.time()
   if complete_callback:
@@ -97,13 +144,17 @@ def build_initial_index(update_callback, complete_callback):
 
 # Function to search the indexed files
 def search_files(query):
-  conn = sqlite3.connect('file_index.db')
-  c = conn.cursor()
-  search_query = f'%{query.lower()}%'
-  c.execute('SELECT filename, filepath FROM files WHERE filename LIKE ? LIMIT 1000', (search_query,))
-  results = c.fetchall()
-  conn.close()
-  return results
+  try:
+      conn = sqlite3.connect('file_index.db')
+      c = conn.cursor()
+      search_query = f'%{query.lower()}%'
+      c.execute('SELECT filename, filepath FROM files WHERE filename LIKE ? LIMIT 1000', (search_query,))
+      results = c.fetchall()
+      conn.close()
+      return results
+  except sqlite3.Error as e:
+      messagebox.showerror("Database Error", f"Error during search: {e}")
+      return []
 
 # Function to open the containing folder and select the file
 def open_containing_folder(filepath):
@@ -111,8 +162,8 @@ def open_containing_folder(filepath):
   if os.path.exists(folder):
       try:
           # Open the containing folder and select the file
-          subprocess.run(['explorer', '/select,', filepath])
-      except Exception as e:
+          subprocess.run(['explorer', '/select,', filepath], check=True)
+      except subprocess.CalledProcessError as e:
           messagebox.showerror("Error", f"Cannot open file: {e}")
   else:
       messagebox.showerror("Error", f"Folder does not exist:\n{folder}")
