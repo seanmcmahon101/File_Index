@@ -1,7 +1,5 @@
 # File Search Tool
 
-![File Search Tool Screenshot](screenshot.png)
-
 ## Table of Contents
 
 - [Introduction](#introduction)
